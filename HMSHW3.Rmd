@@ -1,0 +1,415 @@
+
+```{r setup}
+rm(list = ls())
+set.seed(1)
+require(glue)
+require(RColorBrewer)
+library(qrng)
+require(randtoolbox)
+library(grDevices)  
+library(openxlsx)
+```
+
+``` {r}
+Population <- 1000
+NumYears <- 1
+Year_start <- 2000
+Year_end <- Year_start + NumYears - 1
+Date_start <- as.Date(glue("{Year_start}-01-01"))
+Date_end <- as.Date(glue("{Year_end}-12-31"))
+time_step = "1 week"
+Dates <- seq(Date_start, Date_end, by = time_step)
+dt <- ifelse(time_step == "1 year", 1, ifelse(time_step == "1 month", 1/12, ifelse(time_step == "1 week", 1/52, 1/365)))
+
+beta <- function(date, par){
+  return(par)
+}
+
+logit <- function(p) log(p / (1-p))
+invlogit <- function(x) exp(x)/(1+exp(x))
+
+transform_pars <- function(pars){
+  out <- c(round(invlogit(pars[1])*1000),
+           exp(pars[2]),
+           exp(pars[3]),
+           invlogit(pars[4]))
+  return(out)
+}
+```
+
+```{r}
+run_SIR <- function(pars){
+  pars_t <- transform_pars(pars)
+  
+  SIROut <- array(0, dim = c(length(Dates) + 1, 6))
+  # [,1]: Susceptible
+  # [,2]: Infectious
+  # [,3]: Recovered
+  # [,4]: new_infections
+  # [,5]: new_recovered
+  # [,6]: new_cases
+  
+  # SIROut[t,1] + SIROut[t,2] + SIROut[t,3] = Population
+  SIROut[1,1] <- pars_t[1]
+  SIROut[1,2] <- 1
+  SIROut[1,3] <- Population - SIROut[1,1] - SIROut[1,2]
+  beta <- pars_t[2]
+  gamma <- pars_t[3]
+  rho <- pars_t[4]
+  
+  for (d_num in seq_along(Dates)){
+    date <- Dates[d_num]
+    # Get our current compartments
+    current_S <- SIROut[d_num, 1]
+    current_I <- SIROut[d_num, 2]
+    current_R <- SIROut[d_num, 3]
+    current_N <- current_S + current_I + current_R
+    # Calculate transition probabilities
+    p_inf <- 1 - exp(-beta * (current_I / current_N) * dt)
+    p_rec <- 1 - exp(-gamma * dt)
+    # Calculate number of transitions
+    new_infections <- rbinom(1, current_S, p_inf)
+    new_recovered <- rbinom(1, current_I, p_rec)
+    new_cases <- rbinom(1, new_infections, rho)
+    # Update SIROut
+    SIROut[d_num + 1, 1] <- current_S - new_infections
+    SIROut[d_num + 1, 2] <- current_I + new_infections - new_recovered
+    SIROut[d_num + 1, 3] <- current_R + new_recovered
+    SIROut[d_num, 4] <- new_infections
+    SIROut[d_num, 5] <- new_recovered
+    SIROut[d_num, 6] <- new_cases
+    
+  }
+  toss <- length(Dates) + 1
+  SIROut <- SIROut[-toss,]
+  return(SIROut)
+}
+```
+
+
+```{r}
+error <- function(pars, max_attempts = 5){
+  attempt <- 0
+  valid_ll <- FALSE
+  
+  beta <- exp(pars[2])
+  rho  <- invlogit(pars[4])
+  while (attempt < max_attempts & !valid_ll){
+    attempt <- attempt + 1
+    guess_out <- run_SIR(pars)
+    p_inf <- 1 - exp((-beta * guess_out[,2] / Population) * dt)
+    p_case <- p_inf * rho
+    
+    if (any(p_case < 0 | p_case > 1)) {
+      cat("p_case out of [0,1]:", range(p_case), "\n")
+      return(-1e20)
+    }
+    
+    # if (sum(guess_out[,1] >= obs_data) == length(obs_data)){
+    if (length(which(guess_out[,1] < obs_data)) == 0){
+      log_lik <- sum(dbinom(x = obs_data, size = guess_out[,1], prob = p_case, log = TRUE))
+      valid_ll <- TRUE
+    }
+  }
+  if (!valid_ll) log_lik <- -1e20
+  return(log_lik)
+}
+
+Error <- function(par) {
+  val <- tryCatch({
+    ll <- error(par)
+    if (!is.finite(ll)) return(1e10) 
+    ll
+  }, error = function(e) {
+    1e10
+  })
+  return(val)
+}
+```
+
+
+```{r}
+obs_dataset1 <- read.csv("Homework_3_Dataset_1.csv")
+obs_data <- obs_dataset1[[2]]
+
+n <- 100000
+sobol_points <- sobol(n = n, d = 4, scrambling =  1)
+S0_vals     <- logit(sobol_points[, 1])
+beta_vals  <- log(sobol_points[, 2]*365)
+gamma_vals <- log(sobol_points[, 3]*365)
+rho_vals    <- logit(sobol_points[, 4])              
+
+param_grid <- data.frame(S0_vals, beta_vals, gamma_vals, rho_vals)
+
+log_liks <- numeric(n)
+
+for (i in 1:n) {
+  log_liks[i] <- error(as.numeric(param_grid[i, ]))
+}
+
+plot(S0_vals, log_liks)
+plot(beta_vals, log_liks)
+plot(gamma_vals,log_liks)
+
+
+log_liks_na <- log_liks
+log_liks_na[log_liks_na == -1e20] <- NA
+#log_liks_na[is.infinite(log_liks_na)] <- NA
+
+
+plot(S0_vals, log_liks_na)
+
+plot(beta_vals, log_liks_na)
+
+
+plot(gamma_vals, log_liks_na)
+
+plot(rho_vals, log_liks_na)
+
+best_index <- which.max(log_liks_na)
+best_guess_pars <- as.numeric(param_grid[best_index, ])
+
+
+opt_result <- optim(par = best_guess_pars,
+      fn = function(p) Error(p),
+      method = "Nelder-Mead",
+      control = list(maxit = 1000))
+
+final_pars <- opt_result$par
+final_pars_transformed <- transform_pars(final_pars)
+print(final_pars_transformed)
+
+pars_df1 <- data.frame(
+  parameter = c("S_0", "beta", "gamma", "rho"),
+  value = c(final_pars_transformed[1], final_pars_transformed[2], final_pars_transformed[3], final_pars_transformed[4])
+)
+
+filename <- sprintf("Homework_3_dataset_%d_%s.csv.xlsx", 1, "Tuggle")
+write.xlsx(pars_df1, file = filename, rowNames = FALSE)
+
+```
+
+```{r}
+# DATASET 1 PLOT
+
+plot_filename <- glue("Homework_3_dataset_1_Tuggle_plot.png")
+png(plot_filename, width = 1200, height = 800, res = 150)
+
+
+COLS <- brewer.pal(4, "Set1")
+COLS <- cbind(COLS,adjustcolor(COLS, alpha = 0.1))
+
+n_draws <- 25
+draw_results <- lapply(seq_len(n_draws), function(x) run_SIR(pars = best_guess_pars))
+
+obs_data <- obs_dataset1[[2]] 
+
+best_ll <- Error(final_pars)
+
+par(mfrow=c(2,1), mar = c(5.1,5.1,1.1,0.6), oma = c(0,0,2.1,0))
+plot(Dates, rep(1,length(Dates)), type = 'n', 
+     xlab = "Date", ylab = "Individuals", ylim = c(0,Population))
+for (n_num in seq_len(n_draws)){
+  tmp_draw_results <- draw_results[[n_num]]
+  lines(Dates, tmp_draw_results[,1], col = COLS[2,2], lwd = 2)
+  lines(Dates, tmp_draw_results[,2], col = COLS[1,2], lwd = 2)
+  lines(Dates, tmp_draw_results[,3], col = COLS[3,2], lwd = 2)
+}
+legend("right", legend = c("Susceptible", "Infectious", "Recovered"), lwd = 2, col = COLS[c(2,1,3),1], bty = "n")
+
+XMAX <- max(which(obs_data > 0))
+
+plot(Dates[seq_len(XMAX)], obs_data[seq_len(XMAX)], type = 'n', 
+     xlab = "Date", ylab = "Cases", ylim = c(0,1.25*max(obs_data)))
+for (n_num in seq_len(n_draws)){
+  tmp_draw_results <- draw_results[[n_num]]
+  lines(Dates[seq_len(XMAX)], tmp_draw_results[seq_len(XMAX),6], col = COLS[4,2], lwd = 2)
+}
+points(Dates[seq_len(XMAX)], obs_data[seq_len(XMAX)], pch = 21, cex = 2, bg = COLS[4,1])
+legend("topright", legend = c("Observed", "Predicted"), lwd = c(NA,2), pch = c(21, NA), 
+       col = c(1,COLS[4,1]), pt.bg = c(COLS[4,1],NA), pt.cex = c(2, NA), bty = "n")
+
+mtext(glue("Best log-likelihood for Dataset 1: {best_ll}"), 3, outer = TRUE)
+dev.off()
+
+
+```
+
+```{r}
+obs_dataset2 <- read.csv("Homework_3_Dataset_2.csv")
+obs_data <- obs_dataset2[[2]]
+
+n <- 100000  
+sobol_points <- sobol(n = n, d = 4, scrambling =  1)
+S0_vals     <- logit(sobol_points[, 1])
+beta_vals  <- log(sobol_points[, 2]*365)
+gamma_vals <- log(sobol_points[, 3]*365)
+rho_vals    <- logit(sobol_points[, 4])              
+
+param_grid <- data.frame(S0_vals, beta_vals, gamma_vals, rho_vals)
+
+log_liks <- numeric(n)
+
+for (i in 1:n) {
+  log_liks[i] <- error(as.numeric(param_grid[i, ]))
+}
+
+log_liks_na <- log_liks
+log_liks_na[log_liks_na == -1e20] <- NA
+
+best_index <- which.max(log_liks_na)
+best_guess_pars <- as.numeric(param_grid[best_index, ])
+
+
+opt_result <- optim(par = best_guess_pars,
+      fn = function(p) Error(p),
+      method = "Nelder-Mead",
+      control = list(maxit = 1000))
+
+final_pars <- opt_result$par
+final_pars_transformed <- transform_pars(final_pars)
+print(final_pars_transformed)
+
+pars_df2 <- data.frame(
+  parameter = c("S_0", "beta", "gamma", "rho"),
+  value = c(final_pars_transformed[1], final_pars_transformed[2], final_pars_transformed[3], final_pars_transformed[4])
+)
+
+filename <- sprintf("Homework_3_dataset_%d_%s.csv.xlsx", 2, "Tuggle")
+write.xlsx(pars_df2, file = filename, rowNames = FALSE)
+
+```
+
+```{r}
+
+# DATASET 2 PLOT
+
+plot_filename <- glue("Homework_3_dataset_2_Tuggle_plot.png")
+png(plot_filename, width = 1200, height = 800, res = 150)
+
+
+COLS <- brewer.pal(4, "Set1")
+COLS <- cbind(COLS,adjustcolor(COLS, alpha = 0.1))
+
+n_draws <- 25
+draw_results <- lapply(seq_len(n_draws), function(x) run_SIR(pars = best_guess_pars))
+
+best_ll <- Error(final_pars)
+
+par(mfrow=c(2,1), mar = c(5.1,5.1,1.1,0.6), oma = c(0,0,2.1,0))
+plot(Dates, rep(1,length(Dates)), type = 'n', 
+     xlab = "Date", ylab = "Individuals", ylim = c(0,Population))
+for (n_num in seq_len(n_draws)){
+  tmp_draw_results <- draw_results[[n_num]]
+  lines(Dates, tmp_draw_results[,1], col = COLS[2,2], lwd = 2)
+  lines(Dates, tmp_draw_results[,2], col = COLS[1,2], lwd = 2)
+  lines(Dates, tmp_draw_results[,3], col = COLS[3,2], lwd = 2)
+}
+legend("right", legend = c("Susceptible", "Infectious", "Recovered"), lwd = 2, col = COLS[c(2,1,3),1], bty = "n")
+
+XMAX <- max(which(obs_data > 0))
+
+plot(Dates[seq_len(XMAX)], obs_data[seq_len(XMAX)], type = 'n', 
+     xlab = "Date", ylab = "Cases", ylim = c(0,1.25*max(obs_data)))
+for (n_num in seq_len(n_draws)){
+  tmp_draw_results <- draw_results[[n_num]]
+  lines(Dates[seq_len(XMAX)], tmp_draw_results[seq_len(XMAX),6], col = COLS[4,2], lwd = 2)
+}
+points(Dates[seq_len(XMAX)], obs_data[seq_len(XMAX)], pch = 21, cex = 2, bg = COLS[4,1])
+legend("topright", legend = c("Observed", "Predicted"), lwd = c(NA,2), pch = c(21, NA), 
+       col = c(1,COLS[4,1]), pt.bg = c(COLS[4,1],NA), pt.cex = c(2, NA), bty = "n")
+
+mtext(glue("Best log-likelihood for Dataset 2: {best_ll}"), 3, outer = TRUE)
+dev.off()
+
+```
+
+
+
+```{r}
+obs_dataset3 <- read.csv("Homework_3_Dataset_3.csv")
+obs_data <- obs_dataset3[[2]]
+
+
+n <- 100000  
+sobol_points <- sobol(n = n, d = 4, scrambling =  1)
+S0_vals     <- logit(sobol_points[, 1])
+beta_vals  <- log(sobol_points[, 2] * 365) 
+gamma_vals <- log(sobol_points[, 3] * 365)
+rho_vals    <- logit(sobol_points[, 4])              
+
+param_grid <- data.frame(S0_vals, beta_vals, gamma_vals, rho_vals)
+
+log_liks <- numeric(n)
+
+for (i in 1:n) {
+  log_liks[i] <- error(as.numeric(param_grid[i, ]))
+  }
+log_liks_na <- log_liks
+log_liks_na[log_liks_na == -1e20] <- NA
+
+best_index <- which.max(log_liks_na)
+best_guess_pars <- as.numeric(param_grid[best_index, ])
+
+
+opt_result <- optim(par = best_guess_pars,
+      fn = function(p) Error(p),
+      method = "Nelder-Mead",
+      control = list(maxit = 1000))
+
+final_pars <- opt_result$par
+final_pars_transformed <- transform_pars(final_pars)
+print(final_pars_transformed)
+
+
+pars_df3 <- data.frame(
+  parameter = c("S_0", "beta", "gamma", "rho"),
+  value = c(final_pars_transformed[1], final_pars_transformed[2], final_pars_transformed[3], final_pars_transformed[4])
+)
+
+filename <- sprintf("Homework_3_dataset_%d_%s.csv.xlsx", 3, "Tuggle")
+write.xlsx(pars_df3, file = filename, rowNames = FALSE)
+```
+
+```{r}
+# DATASET 3 PLOT
+
+plot_filename <- glue("Homework_3_dataset_3_Tuggle_plot.png")
+png(plot_filename, width = 1200, height = 800, res = 150)
+
+COLS <- brewer.pal(4, "Set1")
+COLS <- cbind(COLS,adjustcolor(COLS, alpha = 0.1))
+
+n_draws <- 25
+draw_results <- lapply(seq_len(n_draws), function(x) run_SIR(pars = best_guess_pars))
+
+best_ll <- Error(final_pars)
+
+par(mfrow=c(2,1), mar = c(5.1,5.1,1.1,0.6), oma = c(0,0,2.1,0))
+plot(Dates, rep(1,length(Dates)), type = 'n', 
+     xlab = "Date", ylab = "Individuals", ylim = c(0,Population))
+for (n_num in seq_len(n_draws)){
+  tmp_draw_results <- draw_results[[n_num]]
+  lines(Dates, tmp_draw_results[,1], col = COLS[2,2], lwd = 2)
+  lines(Dates, tmp_draw_results[,2], col = COLS[1,2], lwd = 2)
+  lines(Dates, tmp_draw_results[,3], col = COLS[3,2], lwd = 2)
+}
+legend("right", legend = c("Susceptible", "Infectious", "Recovered"), lwd = 2, col = COLS[c(2,1,3),1], bty = "n")
+
+XMAX <- max(which(obs_data > 0))
+
+plot(Dates[seq_len(XMAX)], obs_data[seq_len(XMAX)], type = 'n', 
+     xlab = "Date", ylab = "Cases", ylim = c(0,1.25*max(obs_data)))
+for (n_num in seq_len(n_draws)){
+  tmp_draw_results <- draw_results[[n_num]]
+  lines(Dates[seq_len(XMAX)], tmp_draw_results[seq_len(XMAX),6], col = COLS[4,2], lwd = 2)
+}
+points(Dates[seq_len(XMAX)], obs_data[seq_len(XMAX)], pch = 21, cex = 2, bg = COLS[4,1])
+legend("topright", legend = c("Observed", "Predicted"), lwd = c(NA,2), pch = c(21, NA), 
+       col = c(1,COLS[4,1]), pt.bg = c(COLS[4,1],NA), pt.cex = c(2, NA), bty = "n")
+
+mtext(glue("Best log-likelihood for Dataset 3: {best_ll}"), 3, outer = TRUE)
+dev.off()
+
+```
+
