@@ -1,0 +1,400 @@
+---
+title: "581FP"
+author: "Jaxon"
+date: "2025-06-02"
+output: html_document
+---
+
+```{r}
+# Data Upload
+
+rm(list = ls())
+set.seed(1)
+
+
+require(glue)
+require(MASS)
+require(mvtnorm)
+require(faraway)
+
+setwd("/Users/jaxontuggle/Downloads")
+measles <- read.csv("measles_Jaxson.csv")[,-1]
+
+measles$StartDate <- as.Date(measles$PeriodStartDate, "%m/%d/%Y")
+measles$EndDate <- as.Date(measles$PeriodEndDate, "%m/%d/%Y")
+measles$row_duration <- as.numeric(measles$EndDate - measles$StartDate)
+
+```
+
+```{r} 
+#Organization into Nevada and Cali data subsets monthly from 1945-1960
+
+nevsubset <- measles[which(measles$StartDate >= as.Date("1945-01-01") & 
+                          measles$EndDate <= as.Date("1959-12-01") & 
+                          measles$Admin1Name == "NEVADA"),]
+calsubset <- measles[which(measles$StartDate >= as.Date("1945-01-01") & 
+                          measles$EndDate <= as.Date("1959-12-01") & 
+                          measles$Admin1Name == "CALIFORNIA"),]
+
+all_months <- seq(as.Date("1945-01-01"), as.Date("1959-12-01"), by = "month")
+all_months_fmt <- format(all_months, "%Y-%m")
+full_months_df <- data.frame(YearMonth = all_months_fmt)
+
+nevsubset$YearMonth <- format(nevsubset$StartDate, "%Y-%m")
+nev_data <- aggregate(CountValue ~ YearMonth, data = nevsubset, sum)
+nev_data_full <- merge(full_months_df, nev_data, by = "YearMonth", all.x = TRUE)
+nev_data_full$CountValue[is.na(nev_data_full$CountValue)] <- 1
+NV_obs_data <- nev_data_full$CountValue  
+
+
+calsubset$YearMonth <- format(calsubset$StartDate, "%Y-%m")
+cal_data <- aggregate(CountValue ~ YearMonth, data = calsubset, sum)
+cal_data_full <- merge(full_months_df, cal_data, by = "YearMonth", all.x = TRUE)
+cal_data_full$CountValue[is.na(cal_data_full$CountValue)] <- 0
+CA_obs_data <- cal_data_full$CountValue  
+
+```
+
+
+```{r}
+# Plots of each data 
+
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+nev_data_full$MonthDate <- as.Date(paste0(nev_data_full$YearMonth, "-01"))
+plot(nev_data_full$MonthDate, nev_data_full$CountValue, type = 'l',
+     xlab = "Month", ylab = "Measles Count", 
+     main = "Monthly Measles Cases in Nevada (1945–1959)")
+
+cal_data_full$MonthDate <- as.Date(paste0(cal_data_full$YearMonth, "-01"))
+plot(cal_data_full$MonthDate, cal_data_full$CountValue, type = 'l', 
+     xlab = "Month", ylab = "Measles Count", 
+     main = "Monthly Measles Cases in Cali (1945–1959)")
+
+```
+
+```{r}
+#Constants
+# Gotten from information FRED
+Population_CA <- 9.344e6
+Population_NV <- 149000
+
+NumYears <- 15
+Year_start <- 1945
+Year_end <- Year_start + NumYears - 1
+Date_start <- as.Date(glue("{Year_start}-01-01"))
+Date_end <- as.Date(glue("{Year_end}-12-31"))
+time_step = "1 month"
+Dates <- seq(Date_start, Date_end, by = time_step)
+dt <- ifelse(time_step == "1 year", 1, ifelse(time_step == "1 month", 1/12, ifelse(time_step == "1 week", 1/52, 1/365)))
+
+```
+
+```{r}
+# Needed Functions
+logit_bounds <- function(a, b) {
+  logit_a <- log(a / (1 - a))
+  logit_b <- log(b / (1 - b))
+  runif(1, logit_a, logit_b)
+}
+
+ilogit <- function(x) 1 / (1 + exp(-x))
+
+
+beta <- function(date, par){
+  return(par)
+}
+
+transform_pars <- function(pars){
+  out <- c(exp(pars[1]),
+           exp(pars[2]),
+           exp(pars[3]),
+           #CA
+           ilogit(pars[4]),
+           ilogit(pars[5]),
+           ilogit(pars[6]),
+           ilogit(pars[7]),
+           ilogit(pars[8]),
+           ilogit(pars[9]),
+           exp(pars[10]),
+           exp(pars[11]),
+           #NV
+           ilogit(pars[12]),
+           ilogit(pars[13]),
+           ilogit(pars[14]),
+           ilogit(pars[15]),
+           exp(pars[16]),
+           exp(pars[17]))
+  return(out)
+}
+```
+
+
+
+```{r}
+SIR_TWO_STATE_MODEL <- function(pars) {
+  # Transform
+  pars_t <- transform_pars(pars)
+
+  # Ind Pars 
+  beta_CA <- pars_t[1]
+  beta_NV <- pars_t[2]
+  gamma <- pars_t[3]
+  sea    <- pars_t[4]
+  pea    <- 12 * pars_t[5]
+
+  # CA
+  S0_frac_CA <- pars_t[6]
+  I0_frac_CA <- pars_t[7]*(1 - S0_frac_CA)
+  rho_CA    <- pars_t[8]
+  mig_CA_to_NV <- pars_t[9]
+  mu_CA <- pars_t[10]
+  delta_CA <- pars_t[11]
+
+  # NV
+  S0_frac_NV <- pars_t[12]
+  I0_frac_NV <- pars_t[13] * (1 - S0_frac_NV)
+  rho_NV    <- pars_t[14]
+  mig_NV_to_CA <- pars_t[15]
+  mu_NV <- pars_t[16]
+  delta_NV <- pars_t[17]
+
+  #ICs
+  S_CA <- round(S0_frac_CA * Population_CA)
+  I_CA <- round(I0_frac_CA * Population_CA)
+  R_CA <- Population_CA - S_CA - I_CA
+
+  S_NV <- round(S0_frac_NV * Population_NV)
+  I_NV <- round(I0_frac_NV * Population_NV)
+  R_NV <- Population_NV - S_NV - I_NV
+
+  out <- array(NA, dim = c(length(Dates) + 1, 2, 7))
+  out[1, 1, ] <- c(S_CA, I_CA, R_CA, 0, 0, 0, NA)
+  out[1, 2, ] <- c(S_NV, I_NV, R_NV, 0, 0, 0, NA)
+
+  # --- Time loop ---
+  for (d_num in seq_along(Dates)) {
+    # Vals by State
+    S_CA <- out[d_num, 1, 1]; I_CA <- out[d_num, 1, 2]; R_CA <- out[d_num, 1, 3]
+    S_NV <- out[d_num, 2, 1]; I_NV <- out[d_num, 2, 2]; R_NV <- out[d_num, 2, 3]
+    N_CA <- S_CA + I_CA + R_CA
+    N_NV <- S_NV + I_NV + R_NV
+
+    # Beta
+    beta_t_CA <- beta_CA * (1 + sea * sin(2 * pi * (d_num + pea) / 12))
+    beta_t_NV <- beta_NV * (1 + sea * sin(2 * pi * (d_num + pea) / 12))
+    
+    #Probs
+    p_inf_CA <- 1 - exp(-beta_t_CA * I_CA / N_CA * dt)
+    p_rec_CA <- 1 - exp(-gamma * dt)
+    p_inf_NV <- 1 - exp(-beta_t_NV * I_NV / N_NV * dt)
+    p_rec_NV <- 1 - exp(-gamma * dt)
+
+    #Infs
+    new_inf_CA <- rbinom(1, S_CA, p_inf_CA)
+    new_rec_CA <- rbinom(1, I_CA, p_rec_CA)
+    new_case_CA <- rbinom(1, new_inf_CA, rho_CA)
+
+    new_inf_NV <- rbinom(1, S_NV, p_inf_NV)
+    new_rec_NV <- rbinom(1, I_NV, p_rec_NV)
+    new_case_NV <- rbinom(1, new_inf_NV, rho_NV)
+
+    # B/D 
+    births_CA <- rpois(1, mu_CA * N_CA * dt)
+    births_NV <- rpois(1, mu_NV * N_NV * dt)
+
+    deaths_S_CA <- rbinom(1, S_CA, delta_CA * dt)
+    deaths_I_CA <- rbinom(1, I_CA, delta_CA * dt)
+    deaths_R_CA <- rbinom(1, R_CA, delta_CA * dt)
+    deaths_S_NV <- rbinom(1, S_NV, delta_NV * dt)
+    deaths_I_NV <- rbinom(1, I_NV, delta_NV * dt)
+    deaths_R_NV <- rbinom(1, R_NV, delta_NV * dt)
+    
+    #Migration
+    mig_S_CA_to_NV <- rbinom(1, S_CA, mig_CA_to_NV)
+    mig_I_CA_to_NV <- rbinom(1, I_CA, mig_CA_to_NV)
+    mig_R_CA_to_NV <- rbinom(1, R_CA, mig_CA_to_NV)
+    mig_S_NV_to_CA <- rbinom(1, S_NV, mig_NV_to_CA)
+    mig_I_NV_to_CA <- rbinom(1, I_NV, mig_NV_to_CA)
+    mig_R_NV_to_CA <- rbinom(1, R_NV, mig_NV_to_CA)
+
+    # Updates
+    S_CA_next <- S_CA - new_inf_CA + births_CA - deaths_S_CA -
+      mig_S_CA_to_NV + mig_S_NV_to_CA
+    I_CA_next <- I_CA + new_inf_CA - new_rec_CA - deaths_I_CA -
+      mig_I_CA_to_NV + mig_I_NV_to_CA
+    R_CA_next <- R_CA + new_rec_CA - deaths_R_CA -
+      mig_R_CA_to_NV + mig_R_NV_to_CA
+
+    S_NV_next <- S_NV - new_inf_NV + births_NV - deaths_S_NV -
+      mig_S_NV_to_CA + mig_S_CA_to_NV
+    I_NV_next <- I_NV + new_inf_NV - new_rec_NV - deaths_I_NV -
+      mig_I_NV_to_CA + mig_I_CA_to_NV
+    R_NV_next <- R_NV + new_rec_NV - deaths_R_NV -
+      mig_R_NV_to_CA + mig_R_CA_to_NV
+
+    out[d_num + 1, 1, ] <- c(S_CA_next, I_CA_next,
+                             R_CA_next,new_inf_CA,
+                             new_rec_CA, new_case_CA,
+                             beta_t_CA)
+    out[d_num + 1, 2, ] <- c(S_NV_next, I_NV_next,
+                             R_NV_next, new_inf_NV,
+                             new_rec_NV, new_case_NV,
+                             beta_t_NV)
+
+    out[d_num, 1, 4:6] <- c(new_inf_CA, new_rec_CA, new_case_CA)
+    out[d_num, 2, 4:6] <- c(new_inf_NV, new_rec_NV, new_case_NV)
+    out[d_num, 1, 7] <- beta_t_CA
+    out[d_num, 2, 7] <- beta_t_NV
+  }
+
+  out <- out[-(length(Dates) + 1), , ]
+  return(out)
+}
+
+
+```
+
+
+```{r}
+
+#ATTEMPT AT MCMC FOR MY MODEL
+
+# Proposal Function
+proposal_distribution <- function(proposal_mean, proposal_sd) {
+  rnorm(length(proposal_mean), mean = proposal_mean, sd = proposal_sd)
+}
+
+target_distribution <- function(pars){
+  guess_out <- SIR_TWO_STATE_MODEL(pars)
+  pars_t <- transform_pars(pars)
+
+  # Predicted new cases
+  pred_cases_CA <- guess_out[,1,6]  
+  pred_cases_NV <- guess_out[,2,6]  
+  
+  loglik_CA <- sum(dpois(CA_obs_data, lambda =  pred_cases_CA, log = TRUE))
+  loglik_NV <- sum(dpois(NV_obs_data, lambda = pred_cases_NV, log = TRUE))
+  
+  return(loglik_CA + loglik_NV)
+}
+
+# MH Step
+MH_step <- function(log_p_new, log_p_current){
+  log_alpha <- log_p_new - log_p_current
+  log_r <- log(runif(1))
+  return(log_r < log_alpha)
+}
+
+# MCMC Step
+MCMC_step <- function(current_pars, log_p_current, proposal_sd){
+  new_pars <- proposal_distribution(current_pars, proposal_sd)
+  log_p_new <- target_distribution(new_pars)
+
+  move <- MH_step(log_p_new, log_p_current)
+
+  if (move) {
+    return(list(new_pars, log_p_new))
+  } else {
+    return(list(current_pars, log_p_current))
+  }
+}
+
+# MCMC Loop
+n_pars <- 17
+proposal_sd <- rep(0.1, n_pars)
+
+## Herd Immunity: We know HI 1 - 1/r0 (measles r0~15) so around 93% of pop must be recovered in this model meaning S0 and I0 must both be below 7 percent at least!!
+
+for (i in 1:100) {
+  current_pars <- initial_guess  <- c(
+  log(runif(1,300,500)),               # log(beta_CA) 
+  log(runif(1,300,500)),               # log(beta_NV) 
+  log(52 / 2),                    # log(gamma) 
+
+  logit_bounds(0.6, .8),          # sea
+  logit_bounds(0.2, .4),          # peak
+ 
+  logit_bounds(0.01, 0.05),        # S0_frac_CA
+  logit_bounds(1e-6, 0.01),        # I0_frac_CA
+  logit_bounds(0.4, 0.7),          #  rho_CA
+  logit_bounds(0.0001, 0.01),       # mig_CA_to_NV 
+
+  # CA params on log scale (exp-ed)
+  log(runif(1,.002, .006)),             # mu_CA 
+  log(runif(1,.001, .003)),             # delta_CA 
+
+  # NV params on logit scale
+  logit_bounds(0.01, 0.05),       # S0_frac_NV
+  logit_bounds(1e-6, 0.01),       # I0_frac_NV
+  logit_bounds(0.4, 0.7),         # rho_NV
+  logit_bounds(0.0001, 0.01),      # mig_NV_to_CA
+
+  # NV params on log scale
+  log(runif(1,.002, .006)),             # mu_NV 
+  log(runif(1,.001, .003)))             #delta_NV
+
+
+  loglik <- target_distribution(current_pars)
+
+  if (is.finite(loglik) && !is.nan(loglik)) {
+    valid_params_found <- TRUE
+    best_initial_pars <- current_pars
+    best_initial_loglik <- loglik
+    cat("Valid parameters found on attempt", i, "\n")
+    break
+  } else {
+    cat("Attempt", i, "failed.\n")
+  }
+}
+p_current <- best_initial_loglik
+out<- SIR_TWO_STATE_MODEL(best_initial_pars)
+plot(out[,1,6])
+
+N_chain <- 1000
+all_pars <- matrix(NA, nrow = N_chain, ncol = n_pars)
+all_logp <- numeric(N_chain)
+
+all_pars[1, ] <- current_pars <- initial_guess
+all_logp[1] <- p_current
+
+for (i in 2:N_chain) {
+  step <- MCMC_step(current_pars, p_current, proposal_sd)
+  current_pars <- step[[1]]
+  p_current <- step[[2]]
+
+  all_pars[i, ] <- current_pars
+  all_logp[i] <- p_current
+
+  if (i %% 100 == 0) cat("Step:", i, "Log-Likelihood:", round(p_current, 2), "\n")
+}
+
+#Take the last pars that were valid before hitting 0
+mcmc_pars <- all_pars[1000,]
+mcmc_fit <-  all_logp[1000]
+par <- transform_pars(mcmc_pars)
+out <- SIR_TWO_STATE_MODEL(mcmc_pars)
+cases_ca <- out[,1,6]
+cases_nv <- out[,2,6]
+
+```
+
+```{r} 
+#Graphs
+# Plot observed Nevada measles counts
+par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+plot(nev_data_full$MonthDate, nev_data_full$CountValue, type = 'l', col = "black",
+     xlab = "Year", ylab = "Measles Cases",
+     main = "Observed vs Predicted Measles Cases in Nevada")
+lines(nev_data_full$MonthDate, cases_nv, col = "red", lwd = 2)
+legend("topright", legend = c("Observed", "Predicted"),
+       col = c("black", "red"), lty = 1, lwd = 2)
+
+plot(cal_data_full$MonthDate, cal_data_full$CountValue, type = 'l', col = "black",
+     xlab = "Year", ylab = "Measles Cases",
+     main = "Observed vs Predicted Measles Cases in Cali")
+lines(cal_data_full$MonthDate, cases_ca, col = "red", lwd = 2)
+legend("topright", legend = c("Observed", "Predicted"),
+       col = c("black", "red"), lty = 1, lwd = 2)
+
+```
+
